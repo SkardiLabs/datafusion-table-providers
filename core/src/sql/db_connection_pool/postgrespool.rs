@@ -1,4 +1,6 @@
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap, num::NonZeroU32, path::PathBuf, str::FromStr, sync::Arc, time::Duration,
+};
 
 use crate::{
     util::{self, ns_lookup::verify_ns_lookup_and_tcp_connect},
@@ -239,6 +241,9 @@ impl PostgresConnectionPool {
     ///
     /// If a `pass` parameter is present, it is wrapped in a [`StaticPasswordProvider`]
     /// internally. For dynamic credentials, use [`new_with_password_provider`](Self::new_with_password_provider).
+    /// Optional positive client socket parameters are `keepalives_idle` and
+    /// `keepalives_interval` in seconds, `keepalives_retries` as a probe count,
+    /// and `tcp_user_timeout` in milliseconds. Unset values preserve driver defaults.
     ///
     /// # Errors
     ///
@@ -350,6 +355,7 @@ impl PostgresConnectionPool {
         connection_string.push_str(format!("sslmode={mode} ").as_str());
         let mut config =
             Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
+        apply_tcp_keepalive(&mut config, &params)?;
 
         if let Some(application_name) = params.get("application_name").map(SecretBox::expose_secret)
         {
@@ -460,6 +466,45 @@ impl PostgresConnectionPool {
         };
         Ok(PostgresConnection::new(conn))
     }
+}
+
+/// Optional client-side TCP liveness settings. Apply them to the Config used
+/// by every pooled connection without changing credential construction.
+fn apply_tcp_keepalive(config: &mut Config, params: &HashMap<String, SecretString>) -> Result<()> {
+    for name in [
+        "keepalives_idle",
+        "keepalives_interval",
+        "keepalives_retries",
+        "tcp_user_timeout",
+    ] {
+        let Some(value) = params.get(name) else {
+            continue;
+        };
+        let value = value
+            .expose_secret()
+            .parse::<NonZeroU32>()
+            .context(InvalidIntegerParameterSnafu {
+                parameter_name: name.to_string(),
+            })?
+            .get();
+        config.keepalives(true);
+        match name {
+            "keepalives_idle" => {
+                config.keepalives_idle(Duration::from_secs(u64::from(value)));
+            }
+            "keepalives_interval" => {
+                config.keepalives_interval(Duration::from_secs(u64::from(value)));
+            }
+            "keepalives_retries" => {
+                config.keepalives_retries(value);
+            }
+            // libpq/tokio-postgres spell this transport setting in milliseconds.
+            _ => {
+                config.tcp_user_timeout(Duration::from_millis(u64::from(value)));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parses a connection string into components, extracting `sslmode`, `sslrootcert`,
@@ -703,5 +748,37 @@ mod tests {
             parse_connection_string("host=localhost user=postgres dbname=mydb");
         assert_eq!(conn_str.trim(), "host=localhost user=postgres dbname=mydb");
         assert!(password.is_none());
+        let mut config = Config::from_str(&conn_str).unwrap();
+        let params = HashMap::from([
+            (
+                "keepalives_idle".into(),
+                SecretString::from("30".to_string()),
+            ),
+            (
+                "keepalives_interval".into(),
+                SecretString::from("10".to_string()),
+            ),
+            (
+                "keepalives_retries".into(),
+                SecretString::from("3".to_string()),
+            ),
+            (
+                "tcp_user_timeout".into(),
+                SecretString::from("60000".to_string()),
+            ),
+        ]);
+        apply_tcp_keepalive(&mut config, &params).unwrap();
+        assert_eq!(config.get_keepalives_idle(), Duration::from_secs(30));
+        assert_eq!(
+            config.get_keepalives_interval(),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(config.get_keepalives_retries(), Some(3));
+        assert_eq!(
+            config.get_tcp_user_timeout(),
+            Some(&Duration::from_secs(60))
+        );
+        assert_eq!(config.get_user(), Some("postgres"));
+        assert_eq!(config.get_dbname(), Some("mydb"));
     }
 }
