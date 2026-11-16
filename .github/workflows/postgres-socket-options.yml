@@ -1,15 +1,15 @@
 name: PostgreSQL client socket options
 
 on:
-  push:
+  pull_request:
     branches:
-      - codex/postgres-client-keepalive-20261116
+      - skardi/v0.11.2
 
 permissions:
   contents: read
 
 concurrency:
-  group: postgres-socket-${{ github.ref }}
+  group: postgres-socket-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
@@ -24,6 +24,7 @@ jobs:
       - name: Check PostgreSQL provider
         run: cargo check -p datafusion-table-providers --locked --no-default-features --features postgres
       - name: Verify native socket options preserve connection identity
+        shell: bash
         run: |
-          cargo test -p datafusion-table-providers --locked --no-default-features --features postgres --lib sql::db_connection_pool::postgrespool::tests::parse_connection_string_without_password -- --exact --nocapture | tee "$RUNNER_TEMP/postgres-socket-options-test.log"
-          rg -q '^test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/postgres-socket-options-test.log"
+          cargo test -p datafusion-table-providers --locked --no-default-features --features postgres,datafusion/parquet --lib sql::db_connection_pool::postgrespool::tests::parse_connection_string_without_password -- --exact --nocapture | tee "$RUNNER_TEMP/postgres-socket-options-test.log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/postgres-socket-options-test.log"
